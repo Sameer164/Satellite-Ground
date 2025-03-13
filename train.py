@@ -22,10 +22,6 @@ from model import CrossViewMatcher, SatelliteFeatureExtractor, StreetFeatureExtr
 from dataset import ImageDataset, SingleImageDataset
 from SMTL import softMarginTripletLoss
 
-STREET_IMG_WIDTH = 320
-STREET_IMG_HEIGHT = 180
-SATELLITE_IMG_WIDTH = 256
-SATELLITE_IMG_HEIGHT = 256
 SEQUENCE_SIZE = 7
 
 def ValidateOne(distArray, topK):

@@ -5,6 +5,7 @@ import json
 import math
 import time
 import torch
+import h5py
 from torch.utils.data import Dataset
 from PIL import Image, ImageFile
 from torch.utils.data import DataLoader
@@ -12,6 +13,11 @@ import torchvision.transforms as transforms
 import re
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+SATELLITE_IMG_HEIGHT = 512
+SATELLITE_IMG_WIDTH = 512
+GROUND_IMG_HEIGHT = 512
+GROUND_IMG_WIDTH = 512
 
 def LatLngToPixel(lat, lng, centerLat, centerLng, zoom):
     x, y = LatLngToGlobalPixel(lat, lng, zoom)
@@ -32,7 +38,7 @@ class SingleImageDataset(Dataset):
         # Default transforms if none provided
         if transforms_street is None:
             self.transforms_street = transforms.Compose([
-                transforms.Resize((512, 384)),
+                transforms.Resize((GROUND_IMG_HEIGHT, GROUND_IMG_WIDTH)),
                 transforms.ColorJitter(0.2, 0.2, 0.2) if mode == 'train' else transforms.Lambda(lambda x: x),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
@@ -42,47 +48,36 @@ class SingleImageDataset(Dataset):
             
         if transforms_sat is None:
             self.transforms_sat = transforms.Compose([
-                transforms.Resize((384, 384)),
+                transforms.Resize((SATELLITE_IMG_HEIGHT, SATELLITE_IMG_WIDTH)),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
             ])
         else:
             self.transforms_sat = transforms.Compose(transforms_sat)
         
-        # Get all satellite images
-        sat_path = os.path.join(root, "bingmap")
-        street_path = os.path.join(root, "streetview")
-        
-        # Get all image pairs
-        self.pairs = self._get_pairs(sat_path, street_path)
-        
         # Split dataset
-        total_pairs = len(self.pairs)
         if mode == 'train':
-            self.pairs = self.pairs[:int(total_pairs * split_ratio)]
+            self.pairs = self._get_pairs("cvt_train.h5")
+            total_length = len(self.pairs)
+            self.pairs = self._get_pairs[:0.9*total_length]
         elif mode == 'val':
-            self.pairs = self.pairs[int(total_pairs * split_ratio):int(total_pairs * 0.9)]
+            self.pairs = self._get_pairs("cvt_train.h5")
+            total_length = len(self.pairs)
+            self.pairs = self._get_pairs[0.9*total_length:]
         elif mode == 'test':
-            self.pairs = self.pairs[int(total_pairs * 0.9):]
+            self.pairs = self._get_pairs("cvt_test.h5")
             
         print(f"Loaded {len(self.pairs)} pairs for {mode}")
         
-    def _get_pairs(self, sat_path, street_path):
+    def _get_pairs(self, file_path):
         pairs = []
-        
-        # Get all satellite images
-        sat_images = glob.glob(os.path.join(sat_path, "input*.png"))
-        
-        for sat_img in sat_images:
-            # Extract the number from satellite image name
-            number = re.search(r'input(\d+)\.png', sat_img).group(1)
-            # Construct corresponding street view image path
-            street_img = os.path.join(street_path, f"{number}.jpg")
-            
-            # Check if both images exist
-            if os.path.exists(street_img):
-                pairs.append((sat_img, street_img))
-        
+        with h5py.File(file_path, "r") as f:
+            paths_key = list(f.keys())[3] # Assuming the paths are stored in the 4th key
+            paths = list(f[paths_key])
+            for path in paths:
+                ground_path = path.decode('utf-8')
+                sat_path = ground_path.replace('ground', 'sat')
+                pairs.append((sat_path, ground_path))
         return sorted(pairs)  # Sort to ensure deterministic ordering
         
     def __getitem__(self, index):
