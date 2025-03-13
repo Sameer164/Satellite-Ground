@@ -1,20 +1,20 @@
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import argparse
 from tqdm import tqdm
 from model import CrossViewMatcher
 from dataset import SingleImageDataset
 import numpy as np
+import os
+from sklearn.metrics import precision_recall_curve
+import matplotlib.pyplot as plt
 
-def compute_metrics(similarity_matrix):
+def compute_metrics(similarity_matrix, k_values=[1, 5, 10]):
     """
-    Compute retrieval metrics:
-    - Recall@K (R@K): percentage of queries where correct match is in top K
-    - Mean Reciprocal Rank (MRR)
+    Compute comprehensive retrieval metrics
     """
     num_queries = similarity_matrix.shape[0]
-    
-    # Ground truth matches are along the diagonal
     labels = torch.arange(num_queries, device=similarity_matrix.device)
     
     # Sort similarities in descending order
@@ -25,15 +25,48 @@ def compute_metrics(similarity_matrix):
     
     # Compute Recall@K
     recall = {}
-    for k in [1, 5, 10]:
+    for k in k_values:
         recall[k] = (correct_indices < k).float().mean().item() * 100
     
-    # Compute MRR
+    # Compute MRR (Mean Reciprocal Rank)
     mrr = (1.0 / (correct_indices + 1.0)).mean().item()
     
-    return recall, mrr
+    # Compute localization accuracy (within top K)
+    loc_acc = {}
+    for k in k_values:
+        loc_acc[k] = (correct_indices < k).float().sum().item()
+    
+    return recall, mrr, loc_acc
 
-def test(model, test_loader, device):
+def visualize_results(similarity_matrix, dataset, save_dir, num_examples=5):
+    """
+    Visualize some example matches
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    _, indices = similarity_matrix.topk(5, dim=1)
+    for i in range(num_examples):
+        query = dataset[i]['street']
+        top_matches = [dataset[idx.item()]['satellite'] for idx in indices[i]]
+        
+        # Create visualization...
+        plt.figure(figsize=(15, 3))
+        plt.subplot(1, 6, 1)
+        plt.imshow(query.permute(1, 2, 0))
+        plt.title('Query')
+        
+        for j, match in enumerate(top_matches):
+            plt.subplot(1, 6, j+2)
+            plt.imshow(match.permute(1, 2, 0))
+            plt.title(f'Match {j+1}')
+        
+        plt.savefig(os.path.join(save_dir, f'example_{i}.png'))
+        plt.close()
+
+def test(model, test_loader, device, save_dir='test_results'):
+    """
+    Comprehensive testing function
+    """
     model.eval()
     all_street_embeddings = []
     all_satellite_embeddings = []
@@ -55,26 +88,49 @@ def test(model, test_loader, device):
     satellite_embeddings = torch.cat(all_satellite_embeddings, dim=0)
     
     print("Computing similarity matrix...")
-    # Compute similarity matrix
     similarity = torch.mm(street_embeddings, satellite_embeddings.t())
     
     # Compute metrics
-    recall, mrr = compute_metrics(similarity)
+    recall, mrr, loc_acc = compute_metrics(similarity)
     
+    # Create results directory
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Save results
     print("\nTest Results:")
-    print(f"Recall@1: {recall[1]:.2f}%")
-    print(f"Recall@5: {recall[5]:.2f}%")
-    print(f"Recall@10: {recall[10]:.2f}%")
-    print(f"Mean Reciprocal Rank: {mrr:.4f}")
+    with open(os.path.join(save_dir, 'test_results.txt'), 'w') as f:
+        f.write("Test Results:\n")
+        f.write(f"Number of test samples: {len(test_loader.dataset)}\n\n")
+        
+        print(f"Number of test samples: {len(test_loader.dataset)}")
+        
+        for k in recall.keys():
+            line = f"Recall@{k}: {recall[k]:.2f}%"
+            print(line)
+            f.write(line + '\n')
+        
+        line = f"Mean Reciprocal Rank: {mrr:.4f}"
+        print(line)
+        f.write(line + '\n')
+        
+        for k in loc_acc.keys():
+            line = f"Localization Accuracy@{k}: {loc_acc[k]}/{len(test_loader.dataset)}"
+            print(line)
+            f.write(line + '\n')
     
-    return recall, mrr
+    # Visualize some results
+    visualize_results(similarity, test_loader.dataset, 
+                     os.path.join(save_dir, 'visualizations'))
+    
+    return recall, mrr, loc_acc
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True, help="Path to saved model")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--feature_dims", type=int, default=4096)
-    parser.add_argument("--backbone", type=str, default="vgg16")
+    parser.add_argument("--feature_dims", type=int, default=2048)  # Updated for ResNet50
+    parser.add_argument("--backbone", type=str, default="res50")
+    parser.add_argument("--save_dir", type=str, default="test_results")
     args = parser.parse_args()
 
     # Set device
@@ -100,6 +156,6 @@ if __name__ == "__main__":
     )
     
     # Run test
-    recall, mrr = test(model, test_loader, device)
+    recall, mrr, loc_acc = test(model, test_loader, device, args.save_dir)
 
 

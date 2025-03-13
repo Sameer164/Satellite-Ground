@@ -167,54 +167,158 @@ def validate_model(model, val_loader, device):
     
     return top1_accuracy, top5_accuracy
 
-def train_single_image_matcher(model, train_loader, val_loader, optimizer, device, epochs=50, use_contrastive=True):
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-    best_top1 = 0
+class CombinedLoss(nn.Module):
+    def __init__(self, temperature=0.07, triplet_weight=10.0, contrastive_weight=1.0):
+        super().__init__()
+        self.temperature = temperature
+        self.triplet_weight = triplet_weight
+        self.contrastive_weight = contrastive_weight
+
+    def forward(self, street_embeddings, satellite_embeddings):
+        # InfoNCE/Contrastive Loss
+        logits = torch.mm(street_embeddings, satellite_embeddings.t()) / self.temperature
+        labels = torch.arange(logits.shape[0], device=logits.device)
+        contrastive_loss = F.cross_entropy(logits, labels)
+
+        # Soft Margin Triplet Loss (from SMTL.py in codebase)
+        dists = 2 - 2 * torch.matmul(street_embeddings, satellite_embeddings.t())
+        pos_dists = torch.diag(dists)
+        N = len(pos_dists)
+        diag_ids = torch.arange(N, device=street_embeddings.device)
+
+        # Match from satellite to street
+        triplet_dist_s2p = pos_dists.unsqueeze(1) - dists
+        loss_s2p = torch.log(1 + torch.exp(self.triplet_weight * triplet_dist_s2p))
+        loss_s2p[diag_ids, diag_ids] = 0
+        loss_s2p = loss_s2p.sum() / (N * (N - 1))
+
+        # Match from street to satellite
+        triplet_dist_p2s = pos_dists - dists
+        loss_p2s = torch.log(1 + torch.exp(self.triplet_weight * triplet_dist_p2s))
+        loss_p2s[diag_ids, diag_ids] = 0
+        loss_p2s = loss_p2s.sum() / (N * (N - 1))
+
+        # Combine losses
+        triplet_loss = (loss_s2p + loss_p2s) / 2.0
+        total_loss = self.contrastive_weight * contrastive_loss + triplet_loss
+
+        return total_loss, {
+            'total': total_loss.item(),
+            'contrastive': contrastive_loss.item(),
+            'triplet': triplet_loss.item()
+        }
+
+def train_single_image_matcher(model, train_loader, val_loader, optimizer, device, epochs=100, save_dir='checkpoints'):
+    criterion = CombinedLoss(
+        temperature=0.07,
+        triplet_weight=10.0,
+        contrastive_weight=1.0
+    )
+    
+    # Create save directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    best_loss = float('inf')
+    best_top1 = 0.0
     
     for epoch in range(epochs):
         model.train()
-        epoch_loss = 0
+        epoch_losses = {'total': 0, 'contrastive': 0, 'triplet': 0}
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+        for batch in tqdm(train_loader):
             street_imgs = batch["street"].to(device)
             satellite_imgs = batch["satellite"].to(device)
             
-            # Get embeddings
+            optimizer.zero_grad()
             street_embeddings, satellite_embeddings = model(street_imgs, satellite_imgs)
             
-            # Calculate loss
-            if use_contrastive:
-                loss = contrastive_loss(street_embeddings, satellite_embeddings)
-            else:
-                loss = softMarginTripletLoss(satellite_embeddings, street_embeddings, gamma=10.0)
-            
-            # Optimize
-            optimizer.zero_grad()
+            loss, loss_components = criterion(street_embeddings, satellite_embeddings)
             loss.backward()
             optimizer.step()
             
-            epoch_loss += loss.item()
+            for k in epoch_losses:
+                epoch_losses[k] += loss_components[k]
         
-        scheduler.step()
+        # Calculate average losses
+        avg_losses = {k: v / len(train_loader) for k, v in epoch_losses.items()}
         
         # Print metrics
-        avg_epoch_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch+1}: Loss = {avg_epoch_loss:.4f}")
+        print(f"\nEpoch {epoch+1}")
+        for k, v in avg_losses.items():
+            print(f"Avg {k.capitalize()} Loss: {v:.4f}")
         
-        # Validate
-        if epoch % 5 == 0:
-            top1, top5 = validate_model(model, val_loader, device)
+        # Validate and save model
+        if (epoch + 1) % 5 == 0:  # Validate every 5 epochs
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    street_imgs = batch["street"].to(device)
+                    satellite_imgs = batch["satellite"].to(device)
+                    street_embeddings, satellite_embeddings = model(street_imgs, satellite_imgs)
+                    loss, _ = criterion(street_embeddings, satellite_embeddings)
+                    val_loss += loss.item()
             
-            # Save best model
+            val_loss = val_loss / len(val_loader)
+            print(f"Validation Loss: {val_loss:.4f}")
+            
+            # Compute accuracy metrics
+            top1, top5, top10 = compute_accuracy(model, val_loader, device)
+            print(f"Top-1: {top1:.2f}%, Top-5: {top5:.2f}%, Top-10: {top10:.2f}%")
+            
+            # Save checkpoint
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': val_loss,
+                'top1': top1,
+                'top5': top5,
+                'top10': top10
+            }
+            
+            # Save best model based on validation loss
+            if val_loss < best_loss:
+                best_loss = val_loss
+                torch.save(checkpoint, os.path.join(save_dir, 'best_model_loss.pth'))
+            
+            # Save best model based on top1 accuracy
             if top1 > best_top1:
                 best_top1 = top1
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_top1': best_top1,
-                }, 'best_model.pth')
+                torch.save(checkpoint, os.path.join(save_dir, 'best_model_accuracy.pth'))
+            
+            # Save latest model
+            torch.save(checkpoint, os.path.join(save_dir, 'latest_model.pth'))
+            
+            # Save epoch checkpoint
+            torch.save(checkpoint, os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}.pth'))
 
+def compute_accuracy(model, loader, device):
+    model.eval()
+    all_street_embeddings = []
+    all_satellite_embeddings = []
+    
+    with torch.no_grad():
+        for batch in loader:
+            street_imgs = batch["street"].to(device)
+            satellite_imgs = batch["satellite"].to(device)
+            street_embeddings, satellite_embeddings = model(street_imgs, satellite_imgs)
+            all_street_embeddings.append(street_embeddings)
+            all_satellite_embeddings.append(satellite_embeddings)
+    
+    street_embeddings = torch.cat(all_street_embeddings, dim=0)
+    satellite_embeddings = torch.cat(all_satellite_embeddings, dim=0)
+    
+    similarity = torch.mm(street_embeddings, satellite_embeddings.t())
+    
+    # Calculate top-k accuracy
+    _, indices = similarity.topk(10, dim=1)
+    correct_at_k = torch.arange(similarity.shape[0], device=device).unsqueeze(1) == indices
+    top1 = correct_at_k[:, 0].float().mean().item() * 100
+    top5 = correct_at_k[:, :5].any(dim=1).float().mean().item() * 100
+    top10 = correct_at_k[:, :10].any(dim=1).float().mean().item() * 100
+    
+    return top1, top5, top10
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

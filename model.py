@@ -91,15 +91,33 @@ class SatelliteFeatureExtractor(nn.Module):
 
         return x
 
-class CrossViewMatcher(nn.Module):
-    def __init__(self, feature_dims=4096, backbone="vgg16"):
-        super(CrossViewMatcher, self).__init__()
+class CrossViewAttention(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(
+            embed_dim=feature_dim,
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.norm = nn.LayerNorm(feature_dim)
         
-        # Feature extractors for both views
+    def forward(self, x):
+        attended, _ = self.attention(x, x, x)
+        return self.norm(attended + x)  # residual connection
+
+class CrossViewMatcher(nn.Module):
+    def __init__(self, feature_dims=2048, backbone="res50"):  # Changed default to res50
+        super().__init__()
+        
+        # Feature extractors
         self.street_encoder = StreetFeatureExtractor(backbone=backbone)
         self.satellite_encoder = SatelliteFeatureExtractor(backbone=backbone, inputChannel=3)
         
-        # Projection heads to map features to common space
+        # Add attention layer
+        self.attention = CrossViewAttention(feature_dims)
+        
+        # Projection heads
         self.street_projector = nn.Sequential(
             nn.Linear(feature_dims, feature_dims),
             nn.ReLU(),
@@ -119,7 +137,11 @@ class CrossViewMatcher(nn.Module):
         street_features = self.street_encoder(street_img)
         satellite_features = self.satellite_encoder(satellite_img)
         
-        # Project to common space
+        # Add attention
+        street_features = self.attention(street_features.unsqueeze(1)).squeeze(1)
+        satellite_features = self.attention(satellite_features.unsqueeze(1)).squeeze(1)
+        
+        # Project features
         street_embedding = self.street_projector(street_features)
         satellite_embedding = self.satellite_projector(satellite_features)
         
